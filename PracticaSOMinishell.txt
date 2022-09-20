@@ -1,0 +1,229 @@
+
+//Librerías importadas
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include "parser.h"
+#include <errno.h>
+#include <string.h>
+
+
+// Funciones que hemos desarrollado para la minishell
+int myCD (tline* directorio);
+int mandatos (tline* linea);
+int redirecciones(tline* linea);
+
+
+int main(void) {
+	//Declaramos las variables 
+	char buf[1024]; 
+	tline* line;
+	//Imprimimos el prompt
+	printf("msh> "); 
+	signal(SIGINT, SIG_IGN);	
+	signal(SIGQUIT, SIG_IGN);
+        //Entramos al bucle donde se analiza lo que insertamos por teclado
+	while (fgets(buf,1024,stdin)) { 
+   		line = tokenize(buf);
+		
+		if (line == NULL) {//Si la linea no contiene nada pasamos a la siguiente
+
+			continue;
+
+	    	}
+	    
+		if (line -> background){//No implementamos la funcionalidad para prcoesos en segundo plano
+
+			printf("comando a ejecutarse en background\n");
+
+		} else {//Si la linea contiene algo y no esta en segundo plano entonces llamamos a los mandatos
+
+			mandatos(line);
+
+		}
+
+		printf("msh> ");
+		signal(SIGINT, SIG_IGN);	
+		signal(SIGQUIT, SIG_IGN);
+	}
+	return 0;
+}
+
+
+int myCD (tline* directorio) {
+        //Declaramos las variables
+	char *dir; 
+	char buffer[512];
+	if(directorio -> commands[0].argc > 2){//Como el mandato cd no puede recibir mas de un argumento si esto se cumple imprimiremos un error
+		fprintf(stderr, "Uso: %s solo se admite 1 argumento\n", directorio -> commands[0].argv[0]);
+		return 1;
+	}
+	
+	if (directorio->commands[0].argc == 1){ 
+		dir = getenv("HOME");		
+		if (dir == NULL){		
+			fprintf(stderr, "No existe variable $HOME\n");
+      	}
+	} else { 
+         dir = directorio -> commands[0].argv[1];
+	}
+	
+	if (chdir(dir) != 0) { 
+		fprintf(stderr, "Error al cambiar el directorio: %s\n", strerror(errno));
+		return 1;
+	}  
+	printf("El directorio actual es: %s\n", getcwd(buffer,-1));	
+	return 0;     
+}
+
+int mandatos (tline* linea) {
+        //Declaramos las variables
+	int i,j,k,status;	 
+   	pid_t pid;
+   	int** fds;
+        
+   	if (linea -> ncommands == 1) {//Comprobamos si la linea tiene un mandato
+		
+        	if (strcmp(linea -> commands[0].argv[0], "cd") == 0) {//Si se encuentra un cd llamaremos a la funcion para que se ejcute el cd
+			myCD(linea);
+			return 0;
+		}
+                 if (strcmp(linea -> commands[0].argv[0], "exit") == 0) {//Si se encuentra un exit saldremos de la minishel
+			exit(0);
+		}
+        	pid = fork();
+    
+		if (pid < 0) { 
+			fprintf(stderr, "Ha fallado el fork().\n");
+			return -1;
+		}	
+		else if (pid == 0) {         
+			signal(SIGINT, SIG_DFL);
+			signal(SIGQUIT, SIG_DFL);
+		 
+			redirecciones(linea);
+
+			if ((linea -> commands[0].filename) != NULL) { 
+				execvp(linea -> commands[0].argv[0], linea -> commands[0].argv); 
+				fprintf(stderr,"Se ha producido un error.\n");	
+				exit(-2);
+			} else { 
+				fprintf(stderr,"No se encuentra el mandato %s\n", linea -> commands[0].argv[0]);	
+				exit(-3);
+	    		}	       
+		} else { 
+			wait(&status);
+			return 0;
+		}	
+   	} else if (linea -> ncommands > 1) { //Comprobamos si la linea contiene mas de un mandato
+		fds = (int**) malloc((linea -> ncommands-1) * sizeof(int*)); 
+		for (i=0; i < linea -> ncommands-1; i++) {	
+			fds[i] = (int*) malloc(2*sizeof(int));	
+			pipe(fds[i]); 
+		}
+
+		
+		for (i=0; i < linea -> ncommands; i++) {
+			pid = fork();
+
+	    		if (pid < 0) {	
+				fprintf(stderr,"Ha fallado el fork\n");
+				return -1;
+			}
+			else if (pid == 0) {
+				if ((linea -> commands[0].filename) != NULL) { 
+					signal(SIGINT, SIG_DFL);
+					signal(SIGQUIT, SIG_DFL);
+
+					if (i == 0){ 
+			  			redirecciones(linea); 
+						if(dup2(fds[0][1],1) == -1){
+						fprintf(stderr,"Fallo al hacer dup\n")
+						exit(-1);
+			   			}
+		 			} else if (i == linea -> ncommands-1) {
+						redirecciones(linea); 		        
+						if (dup2(fds[i-1][0],0) == -1){	
+						fprintf(stderr,"Fallo al hacer dup\n");
+						exit(-2);
+						}
+					} else { 
+						if((dup2(fds[i-1][0],0) == -1) || (dup2(fds[i][1],1) == -1)) {
+							fprintf(stderr,"Fallo al hacer dup\n");
+							exit(-3);
+						}
+					}
+				} else { 
+		 			fprintf(stderr, "No se encuentra el mandato %s\n", linea -> commands[0].argv[0]);
+		 			exit(1); 
+	       			}
+	       
+				for (j=0; j < linea -> ncommands-1; j++) { 
+					for (k=0; k < 2; k++) {
+						close(fds[j][k]);
+		  			}
+	       			}
+				execv(linea -> commands[i].filename, linea -> commands[i].argv); 
+		   		fprintf(stderr, "Se ha producido un error\n");
+		   		exit(-4);
+			}
+		} 
+	}
+
+	for (i=0; i < linea -> ncommands-1; i++) { 
+		for(j=0; j < 2; j++) {
+			close(fds[i][j]);
+       		}
+	}
+	
+	for (i=0; i < linea -> ncommands; i++) {
+		wait(&status);
+	}
+	for (i=0; i < linea -> ncommands-1; i++) { 
+		free(fds[i]);
+	}
+	free(fds);
+	return 0;
+}
+
+int redirecciones (tline* linea){
+        //Declaramos las variables
+	int fd;
+	if(linea -> redirect_input != NULL){//Comprobamos si en la linea existe una redireccion de entrada 		
+		fd = open(linea -> redirect_input, O_CREAT | O_RDONLY, 0666);
+		if(fd == -1) { 
+			fprintf(stderr, "%s: Error. %s\n", linea -> redirect_input,strerror(errno));
+			return -1;
+			} 
+		else if (dup2(fd,STDIN_FILENO) == -1){ 
+			return 11;
+		}
+    	} else if (linea -> redirect_output != NULL){//Comprobamos si en la linea existe una redireccion de salida
+		fd = open(linea -> redirect_output , O_CREAT | O_RDWR | O_TRUNC, 0666); 
+		if (fd == -1){
+			fprintf(stderr, "%s: Error. %s\n", linea -> redirect_output,strerror(errno));
+			return -1;
+		}
+		else if (dup2(fd,STDOUT_FILENO) == -1){
+			return 12;
+		}
+	} else if (linea -> redirect_error != NULL){//Comprobamos si en la linea existe una redireccion de error
+        	fd = open(linea -> redirect_error, O_CREAT | O_RDWR, 0666);	
+		if (fd == -1) {
+			fprintf(stderr, "%s: Error. %s\n", linea->redirect_error, strerror(errno));
+			return -1;		
+		}
+		else if (dup2(fd,STDERR_FILENO) == -1) {
+			return 10;
+		}
+    	}
+	return 0;
+}
+
+
+
+
